@@ -1,0 +1,54 @@
+#include <windows.h>
+#include "resource.h"
+
+IDI_APP ICON "acv_fsr4.ico"
+1 RT_MANIFEST "acv_fsr4_setup.manifest"
+
+// Copied here by build_installer.ps1.
+IDR_D3D12 RCDATA "payload\\d3d12.dll"
+IDR_LOADER RCDATA "payload\\amd_fidelityfx_loader_dx12.dll"
+IDR_UPSCALER RCDATA "payload\\amd_fidelityfx_upscaler_dx12.dll"
+
+IDD_MAIN DIALOGEX 0, 0, 330, 196
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+CAPTION "ACV FSR 4 Mod Setup"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "FSR 4 for Assassin's Creed Valhalla", IDC_HEADING, 12, 10, 306, 16
+    LTEXT           "Replaces the game's FSR 1 with AMD FSR 4. Unofficial fan mod for offline single-player.", -1, 12, 28, 306, 10
+    LTEXT           "Game folder", -1, 12, 48, 306, 9
+    EDITTEXT        IDC_FOLDER, 12, 59, 250, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...", IDC_BROWSE, 268, 58, 50, 16
+    LTEXT           "Status", -1, 12, 84, 54, 9
+    LTEXT           "", IDC_STATUS, 68, 84, 250, 9
+    LTEXT           "Graphics card", -1, 12, 97, 54, 9
+    LTEXT           "", IDC_GPU, 68, 97, 250, 9
+    LTEXT           "FSR 4 needs a Radeon RX 6000 series card or newer. On other cards the mod is untested and may not work.", IDC_GPU_WARNING, 68, 109, 250, 18
+    LTEXT           "Close the game before installing or removing the mod.\nKeep this file: run it again whenever you want to remove the mod.", -1, 12, 132, 306, 20
+    DEFPUSHBUTTON   "Install", IDOK, 156, 170, 56, 16
+    PUSHBUTTON      "Uninstall", IDC_UNINSTALL, 216, 170, 56, 16
+    PUSHBUTTON      "Close", IDCANCEL, 276, 170, 42, 16
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "ACV FSR 4 Mod Setup"
+            VALUE "FileVersion", "1.0.0"
+            VALUE "ProductName", "ACV FSR 4 Mod (unofficial)"
+            VALUE "ProductVersion", "1.0.0"
+            VALUE "OriginalFilename", "ACV_FSR4_Setup.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

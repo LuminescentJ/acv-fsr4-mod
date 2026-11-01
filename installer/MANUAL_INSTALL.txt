@@ -1,0 +1,18 @@
+FSR 4 for Assassin's Creed Valhalla  -  manual install version (no installer)
+
+This is the same mod as the main download, as plain files. README.txt has the requirements, keys and troubleshooting.
+
+INSTALL
+1. Close the game.
+2. Open your game folder, the one with ACValhalla.exe in it.
+   Steam default: C:\Program Files (x86)\Steam\steamapps\common\Assassin's Creed Valhalla
+3. Copy these three files into that folder:
+   d3d12.dll
+   amd_fidelityfx_loader_dx12.dll
+   amd_fidelityfx_upscaler_dx12.dll
+   If Windows says d3d12.dll is already there, stop: another mod is using that file. Remove that mod first.
+4. Start the game as usual.
+
+UNINSTALL
+Close the game and delete those three files from the game folder. Nothing else is changed.
+If you used the installer version before, uninstall with that instead.
