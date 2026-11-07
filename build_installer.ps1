@@ -6,7 +6,7 @@
 #>
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
-$version = "1.0.0"
+$version = "1.0.1"
 $src = Join-Path $root "installer"
 $work = Join-Path $root "build_installer"
 $dist = Join-Path $root "dist"

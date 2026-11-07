@@ -14,11 +14,10 @@
  Keys: F2 = settings menu (Up/Down choose, Left/Right or Enter change, F2 or CLOSE to hide) for everything below,
        plus JITTER PHASES 8 (game default) / 16 / 32: more camera jitter positions for FSR 4 to combine (menu only).
        F7 = FSR 4 on/off (stock game when off), F4 = skip the game's own TAA + FSR 1 work on/off (on = faster),
-       F8 / F9 = FSR 4 sharpness down / up (0.0 - 1.0, default 0.3),
-       F3 = indicator square always on/off (top-left: green = FSR 4 upscaling, cyan = FSR 4 native AA; it also shows
-       for 3 s after start-up, F7 and a mode change - no square = stock game).
+       F8 / F9 = FSR 4 sharpness down / up (0.0 - 1.0, default 0.3).
  Every key shows a short on-screen message (e.g. "FSR 4 ON - UPSCALING", "FSR 4 OFF - GAME DEFAULT").
- Sharpness, F4 and F3 (and the same settings changed in the F2 menu) are remembered in %LOCALAPPDATA%\ACVFSR4\settings.ini.
+ AMD Adrenalin shows whether FSR 4 is running.
+ Sharpness and F4 (and the same settings changed in the F2 menu) are remembered in %LOCALAPPDATA%\ACVFSR4\settings.ini.
  Log: %LOCALAPPDATA%\ACVFSR4\acv_fsr4.log
 #>
 param(
@@ -136,9 +135,9 @@ $lines | Set-Content $manifest
 
 Write-Host "`nDone. Start Valhalla from Steam."
 Write-Host "  Valhalla FSR setting ON (Quality etc.) -> FSR 4 upscaling.  FSR OFF -> FSR 4 native AA."
-Write-Host "  F2 = settings menu (arrows + Enter): FSR 4, sharpness, jitter phases (8/16/32), skip stock AA, indicator."
-Write-Host "  F7 = FSR 4 on/off, F4 = skip the game's own TAA/FSR 1 work on/off, F8/F9 = sharpness -/+, F3 = indicator always on/off."
-Write-Host "  Each key shows an on-screen message; sharpness/F4/F3 are remembered between sessions."
-Write-Host "  Top-left square for 3 s after start / F7 / mode change: green = FSR 4 upscaling, cyan = FSR 4 native. None = stock."
+Write-Host "  F2 = settings menu (arrows + Enter): FSR 4, sharpness, jitter phases (8/16/32), skip stock AA."
+Write-Host "  F7 = FSR 4 on/off, F4 = skip the game's own TAA/FSR 1 work on/off, F8/F9 = sharpness -/+."
+Write-Host "  Each key shows an on-screen message; sharpness/F4 are remembered between sessions."
+Write-Host "  AMD Adrenalin shows whether FSR 4 is running."
 Write-Host "  Log: $env:LOCALAPPDATA\ACVFSR4\acv_fsr4.log"
 Write-Host "  Remove with: powershell -ExecutionPolicy Bypass -File .\install_fsr4.ps1 -Uninstall"

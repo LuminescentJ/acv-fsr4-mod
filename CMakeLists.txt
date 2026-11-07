@@ -63,4 +63,22 @@ if(ACV_BUILD_FSR4_RELEASE)
         OUTPUT_NAME "d3d12"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/release/bin"
     )
+
+    # Diagnostic variant for start-up problems on other game builds (see ACV_FSR4_DIAG in the source). Not shipped.
+    add_library(acv_fsr4_diag SHARED
+        src/d3d12_probe.cpp
+        src/d3d12_forwarders.asm
+        src/d3d12_proxy_full.def
+    )
+    target_compile_features(acv_fsr4_diag PRIVATE cxx_std_20)
+    target_compile_definitions(acv_fsr4_diag PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX ACV_FSR4_RELEASE=1 ACV_FSR4_DIAG=1)
+    target_include_directories(acv_fsr4_diag PRIVATE
+        "${CMAKE_SOURCE_DIR}/third_party/FidelityFX-SDK/Kits/FidelityFX/api/include"
+        "${CMAKE_SOURCE_DIR}/third_party/FidelityFX-SDK/Kits/FidelityFX/upscalers/include"
+    )
+    set_property(TARGET acv_fsr4_diag PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    set_target_properties(acv_fsr4_diag PROPERTIES
+        OUTPUT_NAME "d3d12"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/diag/bin"
+    )
 endif()

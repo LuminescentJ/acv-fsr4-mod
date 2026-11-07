@@ -1,4 +1,4 @@
-FSR 4 for Assassin's Creed Valhalla (unofficial fan mod)  -  version 1.0.0
+FSR 4 for Assassin's Creed Valhalla (unofficial fan mod)  -  version 1.0.1
 
 Replaces the game's FSR 1 upscaler with AMD FSR 4.
 
@@ -25,19 +25,23 @@ them, it is left in place. Your settings stay in %LOCALAPPDATA%\ACVFSR4 (a few s
 USE
 - FSR ON in Valhalla's graphics settings: FSR 4 upscaling. Quality is the tested preset; the others should work.
 - FSR OFF: FSR 4 as anti-aliasing at full resolution.
-- A square at the top left for a few seconds after start-up shows that FSR 4 is active: green = upscaling, cyan = anti-aliasing.
+- To check that FSR 4 is running, use AMD Adrenalin. F7 also shows a short "FSR 4 ON" / "FSR 4 OFF" message on screen.
 
 KEYS
-F2  settings menu (Up/Down choose, Left/Right or Enter change): FSR 4, sharpness, jitter phases, skip stock AA, indicator
+F2  settings menu (Up/Down choose, Left/Right or Enter change): FSR 4, sharpness, jitter phases, skip stock AA
 F7  FSR 4 on/off (off = the stock game, handy for comparing)
 F4  skip the game's own TAA and FSR 1 work on/off (on = a little faster)
 F8 / F9  sharpness down / up
-F3  indicator square always on/off
 
 TROUBLESHOOTING
-- No square and F7 does nothing: the mod did not load. Check that no other mod uses d3d12.dll.
+- F7 shows no message: the mod did not load. Check that no other mod uses d3d12.dll.
 - A log is written to %LOCALAPPDATA%\ACVFSR4\acv_fsr4.log. Include it when you report a problem.
 - A game update can stop the mod from working. It should then leave the game running as stock, but that is not guaranteed.
+
+CHANGES
+1.0.1  Fixed the game closing at the logo on some systems (newer game updates and newer Windows / DirectX versions).
+       Removed the indicator square and the F3 key (AMD Adrenalin shows whether FSR 4 is running).
+1.0.0  First release.
 
 NOTES
 This mod is not affiliated with or endorsed by AMD or Ubisoft. Use at your own risk.

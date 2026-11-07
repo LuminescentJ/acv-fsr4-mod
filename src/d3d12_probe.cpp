@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <strsafe.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <array>
@@ -122,6 +123,14 @@ HRESULT STDMETHODCALLTYPE HookedQueryInterface(IUnknown* self, REFIID iid, void*
 bool patchDevice(ID3D12Device* device, size_t vtableLength);
 
 std::unordered_map<void**, DeviceOriginals> g_deviceOriginals;
+// Slots of the runtime's device vtable (newest ID3D12DeviceN it implements). Every clone is at least this long: the
+// Ubisoft Connect build creates the device as ID3D12Device and then calls newer methods on that same pointer, which ran
+// past a 47-slot clone into heap memory (null / garbage calls at start-up).
+std::atomic<size_t> g_deviceSlots{0};
+// Originals of the first patched device (the runtime's device class), for calls that reach a hook through a vtable we
+// don't know (the newer game build swaps the device vtable after ours; its copy still calls our hooks). Under g_hookLock.
+DeviceOriginals g_deviceFallback;
+bool g_haveDeviceFallback = false;
 
 BOOL CALLBACK loadSystemD3d12(PINIT_ONCE, PVOID, PVOID*) {
     wchar_t systemPath[MAX_PATH]{};
@@ -146,6 +155,15 @@ constexpr bool kRelease = ACV_FSR4_RELEASE != 0;
 constexpr unsigned kReleaseMaxLogLines = 2000;
 std::atomic<unsigned> g_logLines{0};
 
+// Diagnostic build (ACV_FSR4_DIAG=1 on top of the release build, for start-up problems on other game builds): logs every
+// line to acv_fsr4_diag.log, plus exceptions and process exit (ACV_DIAG lines, not counted against the line cap).
+// acv_fsr4_diag.txt next to the exe picks how much of the mod runs: 0 full mod, 1 device hooks only, 2 pass-through.
+#ifndef ACV_FSR4_DIAG
+#define ACV_FSR4_DIAG 0
+#endif
+constexpr bool kDiag = ACV_FSR4_DIAG != 0;
+constexpr unsigned kDiagMaxLogLines = 3000;
+
 void openLogIfNeeded() {
     if (g_logFile != INVALID_HANDLE_VALUE) return;
     wchar_t path[MAX_PATH]{};
@@ -153,36 +171,55 @@ void openLogIfNeeded() {
     if (length == 0 || length >= ARRAYSIZE(path)) return;
     if (FAILED(StringCchCatW(path, ARRAYSIZE(path), kRelease ? L"\\ACVFSR4" : L"\\ACVFSR31"))) return;
     CreateDirectoryW(path, nullptr);
-    if (FAILED(StringCchCatW(path, ARRAYSIZE(path), kRelease ? L"\\acv_fsr4.log" : L"\\d3d12_probe.log"))) return;
+    if (FAILED(StringCchCatW(path, ARRAYSIZE(path),
+            kDiag ? L"\\acv_fsr4_diag.log" : (kRelease ? L"\\acv_fsr4.log" : L"\\d3d12_probe.log")))) return;
     // Release: a fresh log per game session. Probe: appended (the test script clears it).
     g_logFile = CreateFileW(path, kRelease ? GENERIC_WRITE : FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, kRelease ? CREATE_ALWAYS : OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 }
 
-void logLine(const char* format, ...) {
-    if (kRelease) {
-        // Only the mod's own lines, and a bounded number of them.
-        const bool ours = strncmp(format, "FSR_", 4) == 0 || strncmp(format, "TAA_", 4) == 0 || strncmp(format, "ACV_", 4) == 0;
-        if (!ours || g_logLines.fetch_add(1) >= kReleaseMaxLogLines) return;
-    }
+// tryOnly: skip the line instead of waiting for the lock (exception handler and process exit, where the lock may be held
+// by this thread or by a thread that no longer exists).
+void writeLogLine(bool tryOnly, const char* format, va_list args) {
     char line[1024]{};
-    va_list args;
-    va_start(args, format);
     const int count = vsnprintf(line, sizeof(line) - 3, format, args);
-    va_end(args);
     if (count < 0) return;
     const size_t length = static_cast<size_t>(count) < sizeof(line) - 3
         ? static_cast<size_t>(count) : sizeof(line) - 3;
     line[length] = '\r';
     line[length + 1] = '\n';
 
-    AcquireSRWLockExclusive(&g_logLock);
+    if (tryOnly) {
+        if (!TryAcquireSRWLockExclusive(&g_logLock)) return;
+    } else {
+        AcquireSRWLockExclusive(&g_logLock);
+    }
     openLogIfNeeded();
     if (g_logFile != INVALID_HANDLE_VALUE) {
         DWORD written = 0;
         WriteFile(g_logFile, line, static_cast<DWORD>(length + 2), &written, nullptr);
     }
     ReleaseSRWLockExclusive(&g_logLock);
+}
+
+void logLine(const char* format, ...) {
+    if (kRelease) {
+        // Only the mod's own lines (every line in the diagnostic build), and a bounded number of them.
+        const bool ours = kDiag || strncmp(format, "FSR_", 4) == 0 || strncmp(format, "TAA_", 4) == 0 || strncmp(format, "ACV_", 4) == 0;
+        if (!ours || g_logLines.fetch_add(1) >= (kDiag ? kDiagMaxLogLines : kReleaseMaxLogLines)) return;
+    }
+    va_list args;
+    va_start(args, format);
+    writeLogLine(false, format, args);
+    va_end(args);
+}
+
+void diagLog(const char* format, ...) {
+    if (!kDiag) return;
+    va_list args;
+    va_start(args, format);
+    writeLogLine(true, format, args);
+    va_end(args);
 }
 
 void* lookupExport(UINT ordinalIndex) {
@@ -233,14 +270,25 @@ void logResource(const char* kind, ID3D12Resource* resource,
         heapType, static_cast<unsigned>(heapFlags), static_cast<unsigned long long>(offset));
 }
 
+void getDeviceOriginalMissed(ID3D12Device* self, void** table, size_t slot);
+
 void* getDeviceOriginal(ID3D12Device* self, size_t slot) {
-    if (!self) return nullptr;
+    if (!self || slot >= kDeviceOriginalSlots) return nullptr;
     void** table = *reinterpret_cast<void***>(self);
     AcquireSRWLockShared(&g_hookLock);
     auto it = g_deviceOriginals.find(table);
     void* original = nullptr;
-    if (it != g_deviceOriginals.end() && slot < kDeviceOriginalSlots) original = it->second.slots[slot];
+    bool missed = false;
+    if (it != g_deviceOriginals.end()) {
+        original = it->second.slots[slot];
+    } else if (g_haveDeviceFallback) {
+        // Someone else swapped the device's vtable after ours (a copy of our clone with their own hooks) and called
+        // through to us: the device is still the runtime's, so the runtime's function for the slot is the original.
+        original = g_deviceFallback.slots[slot];
+        missed = true;
+    }
     ReleaseSRWLockShared(&g_hookLock);
+    if (missed) getDeviceOriginalMissed(self, table, slot);
     return original;
 }
 
@@ -261,6 +309,23 @@ size_t deviceVtableLength(REFIID iid) {
     if (IsEqualIID(iid, __uuidof(ID3D12Device13))) return 88;
     if (IsEqualIID(iid, __uuidof(ID3D12Device14))) return 89;
     return 0;
+}
+
+// Length of the device's real vtable: the newest ID3D12DeviceN it answers to.
+size_t measureDeviceVtable(IUnknown* device) {
+    static const IID* const kNewestFirst[] = {
+        &__uuidof(ID3D12Device14), &__uuidof(ID3D12Device13), &__uuidof(ID3D12Device12), &__uuidof(ID3D12Device11),
+        &__uuidof(ID3D12Device10), &__uuidof(ID3D12Device9), &__uuidof(ID3D12Device8), &__uuidof(ID3D12Device7),
+        &__uuidof(ID3D12Device6), &__uuidof(ID3D12Device5), &__uuidof(ID3D12Device4), &__uuidof(ID3D12Device3),
+        &__uuidof(ID3D12Device2), &__uuidof(ID3D12Device1) };
+    for (const IID* iid : kNewestFirst) {
+        IUnknown* newer = nullptr;
+        if (SUCCEEDED(device->QueryInterface(*iid, reinterpret_cast<void**>(&newer))) && newer) {
+            newer->Release();
+            return deviceVtableLength(*iid);
+        }
+    }
+    return deviceVtableLength(__uuidof(ID3D12Device));
 }
 
 HRESULT STDMETHODCALLTYPE HookedQueryInterface(IUnknown* self, REFIID iid, void** objectOut) {
@@ -909,7 +974,34 @@ void STDMETHODCALLTYPE HookedCopyDescriptorsSimple(ID3D12Device* self, UINT num,
     ReleaseSRWLockShared(&g_heapLock);
 }
 
+bool readPointerGuarded(void* const* source, void** value) {
+    __try {
+        *value = *source;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+// Leading vtable entries that point at executable code in a loaded image: the real length, also when the runtime
+// implements device interfaces newer than our headers (Windows Insider builds; a 2026 game build calls those methods,
+// which ran past an 89-slot clone). MSVC puts the next vtable's RTTI pointer (.rdata, not code) right after a vtable.
+size_t scanVtableLength(void** table, size_t cap) {
+    size_t n = 0;
+    for (; n < cap; ++n) {
+        void* entry = nullptr;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!readPointerGuarded(table + n, &entry) || !entry || !VirtualQuery(entry, &mbi, sizeof(mbi))) break;
+        constexpr DWORD kExecutable = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if (mbi.State != MEM_COMMIT || mbi.Type != MEM_IMAGE || !(mbi.Protect & kExecutable)) break;
+    }
+    return n;
+}
+
+constexpr size_t kMaxDeviceVtableScan = 512;
+
 bool patchDevice(ID3D12Device* device, size_t requestedLength) {
+    requestedLength = (std::max)(requestedLength, g_deviceSlots.load());
     if (!device || requestedLength <= kSlotCreateReservedResource) return false;
     auto*** vtableAddress = reinterpret_cast<void***>(device);
     void** currentTable = *vtableAddress;
@@ -925,8 +1017,9 @@ bool patchDevice(ID3D12Device* device, size_t requestedLength) {
     // avoids changing the D3D12 runtime's shared, read-only vtable.
     void** originalTable = existing == g_deviceOriginals.end()
         ? currentTable : existing->second.originalVtable;
-    const size_t cloneLength = (existing == g_deviceOriginals.end())
-        ? requestedLength : requestedLength;
+    const size_t scannedLength = scanVtableLength(originalTable, kMaxDeviceVtableScan);
+    const size_t cloneLength = (std::max)(requestedLength, scannedLength);
+    if (cloneLength > g_deviceSlots.load()) g_deviceSlots.store(cloneLength);
     void** clone = static_cast<void**>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
         cloneLength * sizeof(void*)));
     if (!clone) {
@@ -960,6 +1053,10 @@ bool patchDevice(ID3D12Device* device, size_t requestedLength) {
     clone[kSlotCreateCommittedResource] = reinterpret_cast<void*>(&HookedCreateCommittedResource);
     clone[kSlotCreatePlacedResource] = reinterpret_cast<void*>(&HookedCreatePlacedResource);
     clone[kSlotCreateReservedResource] = reinterpret_cast<void*>(&HookedCreateReservedResource);
+    if (!g_haveDeviceFallback) {
+        g_deviceFallback = originals;
+        g_haveDeviceFallback = true;
+    }
     try {
         g_deviceOriginals.emplace(clone, originals);
     } catch (...) {
@@ -969,8 +1066,9 @@ bool patchDevice(ID3D12Device* device, size_t requestedLength) {
     }
 
     InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(vtableAddress), clone);
-    logLine("DEVICE_VTABLE_CLONED device=%p old=%p clone=%p entries=%llu",
-        device, originalTable, clone, static_cast<unsigned long long>(cloneLength));
+    logLine("ACV_DEVICE_CLONED device=%p old=%p clone=%p entries=%llu scanned=%llu",
+        device, originalTable, clone, static_cast<unsigned long long>(cloneLength),
+        static_cast<unsigned long long>(scannedLength));
     ReleaseSRWLockExclusive(&g_hookLock);
     return true;
 }
@@ -1003,7 +1101,7 @@ constexpr size_t kListSetDescriptorHeaps = 28;
 constexpr size_t kQueueExecuteCommandLists = 10;
 constexpr UINT kMaxDescriptorsPerTableLog = 64;
 constexpr UINT kMinLoggedDescriptorDim = 256;
-constexpr int kMaxTables = 8;
+constexpr int kMaxTables = 32;
 constexpr long long kCaptureWindowMs = 150;
 constexpr size_t kMaxCaptureBytes = 96u * 1024u * 1024u;
 
@@ -1117,17 +1215,51 @@ void noteFired(std::atomic<bool>& flag, const char* name) {
     if (!flag.exchange(true)) logLine("TRACE_HOOK_FIRED %s", name);
 }
 
+void tableAliasLogged(const char* kind, void** vt, void** knownVt, int matches);
+
+// A call reached a list/queue hook through a vtable we never patched: someone copied a patched runtime vtable (our hooks
+// included) and swapped it into the object. The runtime vtable it was copied from is the one with the most identical
+// slots; that table's originals belong to this object. The copy is remembered as an alias with the same originals.
+template <typename Table>
+const Table* findAliasTable(void** vt, Table* tables, std::atomic<int>& count, size_t slots, const char* kind) {
+    AcquireSRWLockExclusive(&g_tableLock);
+    const int n = count.load();
+    for (int i = 0; i < n; ++i) {
+        if (tables[i].vtbl == vt) { ReleaseSRWLockExclusive(&g_tableLock); return &tables[i]; }
+    }
+    int best = -1, bestMatches = 0;
+    for (int i = 0; i < n; ++i) {
+        int matches = 0;
+        for (size_t s = 0; s < slots; ++s) matches += tables[i].vtbl[s] == vt[s] ? 1 : 0;
+        if (matches > bestMatches) { best = i; bestMatches = matches; }
+    }
+    const Table* found = nullptr;
+    if (best >= 0 && bestMatches * 2 >= static_cast<int>(slots)) {
+        found = &tables[best];
+        if (n < kMaxTables) {
+            tables[n] = tables[best];
+            tables[n].vtbl = vt;
+            count.store(n + 1, std::memory_order_release);
+            found = &tables[n];
+        }
+    }
+    void** knownVt = found ? tables[best].vtbl : nullptr;
+    ReleaseSRWLockExclusive(&g_tableLock);
+    tableAliasLogged(kind, vt, knownVt, bestMatches);
+    return found;
+}
+
 const ListTable* findListTable(void* self) {
     void** vt = *reinterpret_cast<void***>(self);
     const int n = g_listTableCount.load(std::memory_order_acquire);
     for (int i = 0; i < n; ++i) if (g_listTables[i].vtbl == vt) return &g_listTables[i];
-    return nullptr;
+    return findAliasTable(vt, g_listTables, g_listTableCount, kListExecuteIndirect + 1, "list");
 }
 const QueueTable* findQueueTable(void* self) {
     void** vt = *reinterpret_cast<void***>(self);
     const int n = g_queueTableCount.load(std::memory_order_acquire);
     for (int i = 0; i < n; ++i) if (g_queueTables[i].vtbl == vt) return &g_queueTables[i];
-    return nullptr;
+    return findAliasTable(vt, g_queueTables, g_queueTableCount, kQueueExecuteCommandLists + 1, "queue");
 }
 
 void traceLine(const char* format, ...) {
@@ -1342,7 +1474,13 @@ constexpr UINT kTaaInputCount = 7;
 constexpr uint16_t kTaaInputFormatsLdr[kTaaInputCount] = {28, 28, 41, 61, 28, 61, 28};
 constexpr uint16_t kTaaInputFormatsHdr[kTaaInputCount] = {10, 28, 41, 61, 10, 61, 10};
 const uint16_t* const kTaaInputFormatSets[] = {kTaaInputFormatsLdr, kTaaInputFormatsHdr};
+// TAA inputs at least 1280 wide always match. Narrower ones (down to 640: 1280x800 with game FSR Performance, e.g. the
+// Steam Deck) match only when no >= 1280 TAA has been seen for a while, so a smaller pass with the same format run can't
+// be taken for the real TAA at normal resolutions (none has been seen, but the old 1280 limit hid any).
 constexpr UINT kTaaInputMinWidth = 1280;
+constexpr UINT kTaaInputLowResMinWidth = 640;
+constexpr ULONGLONG kTaaLowResAfterMs = 2000;
+std::atomic<ULONGLONG> g_lastLargeTaaTick{0};
 constexpr D3D12_RESOURCE_STATES kTaaInputState =
     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 constexpr ULONGLONG kDumpSubmitTimeoutMs = 5000;
@@ -1639,10 +1777,13 @@ bool matchTaaInputs(ID3D12GraphicsCommandList* list, UINT param, D3D12_GPU_DESCR
     }
     ReleaseSRWLockShared(&g_rsLock);
 
+    const ULONGLONG now = GetTickCount64();
+    const bool lowResAllowed = now - g_lastLargeTaaTick.load(std::memory_order_relaxed) >= kTaaLowResAfterMs;
     for (UINT start = 0; srvCount >= kTaaInputCount && start + kTaaInputCount <= srvCount; ++start) {
         bool match = false;
+        const UINT64 width = srvs[start].width;
         for (const uint16_t* formats : kTaaInputFormatSets) {
-            match = srvs[start].width >= kTaaInputMinWidth;
+            match = width >= kTaaInputMinWidth || (lowResAllowed && width >= kTaaInputLowResMinWidth);
             for (UINT k = 0; match && k < kTaaInputCount; ++k) {
                 const DescEntry& e = srvs[start + k];
                 match = e.resFormat == formats[k] && e.width == srvs[start].width &&
@@ -1651,6 +1792,14 @@ bool matchTaaInputs(ID3D12GraphicsCommandList* list, UINT param, D3D12_GPU_DESCR
             if (match) break;
         }
         if (!match) continue;
+        if (width >= kTaaInputMinWidth) {
+            g_lastLargeTaaTick.store(now, std::memory_order_relaxed);
+        } else {
+            static std::atomic<bool> s_loggedLowRes{false};
+            if (!s_loggedLowRes.exchange(true))
+                logLine("TAA_LOW_RES matched %llux%u (no >= %u wide TAA for %llu ms)", static_cast<unsigned long long>(width),
+                    srvs[start].height, kTaaInputMinWidth, static_cast<unsigned long long>(kTaaLowResAfterMs));
+        }
         for (UINT k = 0; k < kTaaInputCount; ++k) taa[k] = srvs[start + k];
         *rootSigOut = rootSig;
         AcquireSRWLockExclusive(&g_taaSeenLock);
@@ -2775,7 +2924,9 @@ void drawText(ID3D12GraphicsCommandList* list, ID3D12Resource* target, bool hdr)
 
 // Draws the indicator into `target` (in UAV state, just written by FFX). Green = FSR 4 upscaling, cyan = FSR 4 native AA.
 // Must be called inside t_inOwnWork with the game state saved (it sets our heap / root sig / PSO).
+// Probe build only: the release mod has no square (AMD Adrenalin's overlay shows whether FSR 4 is running).
 void drawIndicator(ID3D12GraphicsCommandList* list, ID3D12Resource* target, bool native) {
+    if (kRelease) return;
     if (!g_up.indicatorPso || !(g_up.indicatorAlways || GetTickCount64() < g_up.indicatorUntil)) return;
     ID3D12Device* device = nullptr;
     if (FAILED(list->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device))) || !device) return;
@@ -4424,6 +4575,7 @@ void buildMenuLines(char lines[][kTextMaxChars + 1], float colors[][3], UINT* co
     };
     add(kCyan, "FSR 4 SETTINGS      F2 CLOSE");
     for (UINT item = 0; item < kMenuItemCount; ++item) {
+        if (kRelease && item == kMenuIndicator) continue;
         const bool selected = g_up.menuSelection == item;
         const char mark = selected ? '>' : ' ';
         const float* rgb = selected ? kYellow : kWhite;
@@ -4457,7 +4609,7 @@ void pollMenuKeys() {
     if (up || down) {
         do {
             g_up.menuSelection = (g_up.menuSelection + (up ? kMenuItemCount - 1 : 1)) % kMenuItemCount;
-        } while (g_up.menuSelection == kMenuMode);
+        } while (g_up.menuSelection == kMenuMode || (kRelease && g_up.menuSelection == kMenuIndicator));
     }
     if (!(left || right || enter)) return;
     switch (g_up.menuSelection) {
@@ -4491,7 +4643,7 @@ void pollFsrKey() {
             MessageBeep(MB_ICONASTERISK);
         }
     }
-    if (pollKeyEdge(VK_F3, g_f3Down)) toggleIndicator();
+    if (!kRelease && pollKeyEdge(VK_F3, g_f3Down)) toggleIndicator();
     if (pollKeyEdge(VK_F4, g_f4Down)) toggleSkip();
     if (!kRelease && pollKeyEdge(VK_F5, g_f5Down)) {
         const bool on = !g_fsrDebugView.load();
@@ -4507,16 +4659,161 @@ extern "C" void* WINAPI ResolveD3D12Export(UINT ordinalIndex) {
     return lookupExport(ordinalIndex);
 }
 
+// ---------- Diagnostic build ----------
+ULONGLONG g_diagStart = 0;
+std::atomic<unsigned> g_diagExceptions{0};
+constexpr unsigned kDiagMaxExceptions = 60;
+
+// "name+0xOFFSET" for a code address (module base name only, no folders).
+void diagDescribeAddress(const void* address, char* out, size_t size) {
+    HMODULE module = nullptr;
+    wchar_t path[MAX_PATH]{};
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            static_cast<LPCWSTR>(address), &module) && module && GetModuleFileNameW(module, path, MAX_PATH)) {
+        const wchar_t* slash = wcsrchr(path, L'\\');
+        snprintf(out, size, "%ls+0x%llX", slash ? slash + 1 : path,
+            static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(address) - reinterpret_cast<ULONG_PTR>(module)));
+    } else {
+        snprintf(out, size, "?%p", address);
+    }
+}
+
+// Declared in the anonymous namespace above (getDeviceOriginal, findAliasTable).
+namespace {
+// Who owns a vtable we don't know, and who called through it (diagnostic build: plus the call stack).
+void logForeignVtable(const char* what, void** table) {
+    char owner[160];
+    diagDescribeAddress(table, owner, sizeof(owner));
+    logLine("%s vtable=%p (%s)", what, static_cast<void*>(table), owner);
+    if (!kDiag) return;
+    void* frames[8]{};
+    const USHORT count = RtlCaptureStackBackTrace(2, 8, frames, nullptr);
+    for (USHORT i = 0; i < count; ++i) {
+        char where[160];
+        diagDescribeAddress(frames[i], where, sizeof(where));
+        logLine("ACV_DIAG   called from #%u %s", static_cast<unsigned>(i), where);
+    }
+}
+
+void getDeviceOriginalMissed(ID3D12Device*, void** table, size_t slot) {
+    static std::atomic<unsigned long long> s_logged{0};
+    const unsigned long long bit = 1ull << (slot & 63);
+    if (s_logged.fetch_or(bit) & bit) return;
+    char what[96];
+    snprintf(what, sizeof(what), "ACV_DEVICE_FALLBACK slot=%llu", static_cast<unsigned long long>(slot));
+    logForeignVtable(what, table);
+}
+
+void tableAliasLogged(const char* kind, void** vt, void** knownVt, int matches) {
+    char what[128];
+    snprintf(what, sizeof(what), "ACV_TABLE_ALIAS %s matches=%d copied_from=%p%s", kind, matches, static_cast<void*>(knownVt),
+        knownVt ? "" : " (none: crash likely)");
+    logForeignVtable(what, vt);
+}
+}  // namespace
+
+LONG CALLBACK diagExceptionHandler(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD* record = info->ExceptionRecord;
+    const DWORD code = record->ExceptionCode;
+    // Thread names and debug output are not errors.
+    if (code == 0x406D1388 || code == DBG_PRINTEXCEPTION_C || code == 0x4001000A) return EXCEPTION_CONTINUE_SEARCH;
+    if (g_diagExceptions.fetch_add(1) >= kDiagMaxExceptions) return EXCEPTION_CONTINUE_SEARCH;
+    char where[160];
+    diagDescribeAddress(record->ExceptionAddress, where, sizeof(where));
+    diagLog("ACV_DIAG exception code=0x%08lX at %s thread=%lu info=0x%llX,0x%llX t=%llums", code, where, GetCurrentThreadId(),
+        static_cast<unsigned long long>(record->NumberParameters > 0 ? record->ExceptionInformation[0] : 0),
+        static_cast<unsigned long long>(record->NumberParameters > 1 ? record->ExceptionInformation[1] : 0),
+        GetTickCount64() - g_diagStart);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// acv_fsr4_diag.txt next to the exe: first digit 0/1/2 (missing file = 0, full mod).
+int diagMode() {
+    static int s_mode = -1;
+    if (s_mode >= 0) return s_mode;
+    s_mode = 0;
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    wchar_t* slash = length && length < MAX_PATH ? wcsrchr(path, L'\\') : nullptr;
+    if (!slash) return s_mode;
+    slash[1] = L'\0';
+    if (FAILED(StringCchCatW(path, MAX_PATH, L"acv_fsr4_diag.txt"))) return s_mode;
+    const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return s_mode;
+    char text[16]{};
+    DWORD read = 0;
+    ReadFile(file, text, sizeof(text) - 1, &read, nullptr);
+    CloseHandle(file);
+    for (DWORD i = 0; i < read; ++i) {
+        if (text[i] >= '0' && text[i] <= '2') { s_mode = text[i] - '0'; break; }
+    }
+    return s_mode;
+}
+
+// Once, at the first D3D12CreateDevice: game exe, Windows build and the modules loaded so far (overlays, other mods).
+void diagLogEnvironment() {
+    wchar_t exePath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    GetFileAttributesExW(exePath, GetFileExInfoStandard, &attributes);
+    const BYTE* exe = reinterpret_cast<const BYTE*>(GetModuleHandleW(nullptr));
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exe + reinterpret_cast<const IMAGE_DOS_HEADER*>(exe)->e_lfanew);
+    const wchar_t* exeName = wcsrchr(exePath, L'\\');
+    logLine("ACV_DIAG exe=%ls bytes=%llu timestamp=0x%08lX image=0x%lX mode=%d", exeName ? exeName + 1 : exePath,
+        (static_cast<unsigned long long>(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow,
+        nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage, diagMode());
+    using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+    OSVERSIONINFOW os{sizeof(os)};
+    if (auto get = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion")); get && get(&os) == 0)
+        logLine("ACV_DIAG windows=%lu.%lu.%lu", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber);
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    MODULEENTRY32W entry{sizeof(entry)};
+    std::string names;
+    for (BOOL more = Module32FirstW(snapshot, &entry); more; more = Module32NextW(snapshot, &entry)) {
+        char name[MAX_MODULE_NAME32 + 1]{};
+        WideCharToMultiByte(CP_UTF8, 0, entry.szModule, -1, name, sizeof(name), nullptr, nullptr);
+        if (!names.empty()) names += ' ';
+        names += name;
+        if (names.size() > 700) { logLine("ACV_DIAG modules %s", names.c_str()); names.clear(); }
+    }
+    if (!names.empty()) logLine("ACV_DIAG modules %s", names.c_str());
+    CloseHandle(snapshot);
+}
+
+// Process exit through ExitProcess (a crash or TerminateProcess skips this): who called it.
+void diagLogExit() {
+    void* frames[24]{};
+    const USHORT count = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+    diagLog("ACV_DIAG process exit t=%llums exceptions=%u frames=%u", GetTickCount64() - g_diagStart, g_diagExceptions.load(),
+        static_cast<unsigned>(count));
+    for (USHORT i = 0; i < count; ++i) {
+        char where[160];
+        diagDescribeAddress(frames[i], where, sizeof(where));
+        diagLog("ACV_DIAG   #%u %s", static_cast<unsigned>(i), where);
+    }
+}
+
 extern "C" HRESULT WINAPI D3D12CreateDevice(IUnknown* adapter,
     D3D_FEATURE_LEVEL minimumFeatureLevel, REFIID riid, void** deviceOut) {
     auto original = reinterpret_cast<D3D12CreateDeviceFn>(lookupExport(2));
     if (!original) return E_NOINTERFACE;
+    if (kDiag) {
+        static std::atomic<bool> s_environment{false};
+        if (!s_environment.exchange(true)) diagLogEnvironment();
+        logLine("ACV_DIAG D3D12CreateDevice call adapter=%p riid=%08lX out=%p t=%llums", adapter, riid.Data1, deviceOut,
+            GetTickCount64() - g_diagStart);
+    }
     const HRESULT hr = original(adapter, minimumFeatureLevel, riid, deviceOut);
     static std::atomic<bool> s_announced{false};
     if (!s_announced.exchange(true)) {
-        logLine("ACV_FSR4 %s build loaded. Keys: F2 settings menu (arrows + Enter), F7 FSR 4 on/off, F4 skip stock TAA+FSR 1 on/off, F8/F9 sharpness -/+ "
-            "(release), F3 indicator always on/off. "
-            "Game FSR on = upscale mode (green square), game FSR off = native AA mode (cyan square).", kRelease ? "release" : "probe");
+        logLine("ACV_FSR4 %s build loaded. Keys: F2 settings menu (arrows + Enter), F7 FSR 4 on/off, F4 skip stock TAA+FSR 1 on/off, %s"
+            "Game FSR on = upscale mode, game FSR off = native AA mode.", kRelease ? "release" : "probe",
+            kRelease ? "F8/F9 sharpness -/+. " : "F3 indicator square always on/off. ");
+    }
+    if (kDiag && diagMode() == 2) {
+        logLine("ACV_DIAG pass-through: no hooks hr=0x%08X", static_cast<unsigned>(hr));
+        return hr;
     }
     logLine("D3D12CreateDevice adapter=%p minFeatureLevel=0x%X riid=%08X-%04X-%04X hr=0x%08X",
         adapter, static_cast<unsigned>(minimumFeatureLevel), riid.Data1, riid.Data2, riid.Data3,
@@ -4526,6 +4823,9 @@ extern "C" HRESULT WINAPI D3D12CreateDevice(IUnknown* adapter,
         // for ID3D12Device5). COM implementations may expose that interface
         // with a different vtable from ID3D12Device, so patch both pointers.
         auto* requestedDevice = reinterpret_cast<ID3D12Device*>(*deviceOut);
+        const size_t slots = measureDeviceVtable(static_cast<IUnknown*>(*deviceOut));
+        if (slots > g_deviceSlots.load()) g_deviceSlots.store(slots);
+        logLine("ACV_DEVICE requested=%08lX vtable_slots=%llu", riid.Data1, static_cast<unsigned long long>(g_deviceSlots.load()));
         const size_t requestedLength = deviceVtableLength(riid);
         const bool requestedPatched = patchDevice(requestedDevice,
             requestedLength ? requestedLength : 47);
@@ -4538,7 +4838,8 @@ extern "C" HRESULT WINAPI D3D12CreateDevice(IUnknown* adapter,
             reinterpret_cast<void**>(&baseDevice)))) {
             const bool patched = patchDevice(baseDevice, 47);
             logLine("D3D12 device hook %s device=%p", patched ? "installed" : "failed", baseDevice);
-            if (patched) installTraceHooks(baseDevice);
+            if (kDiag && diagMode() == 1) logLine("ACV_DIAG device hooks only: command list/queue hooks skipped");
+            else if (patched) installTraceHooks(baseDevice);
             scheduleFfxTest(baseDevice);
             baseDevice->Release();
         } else {
@@ -4549,6 +4850,15 @@ extern "C" HRESULT WINAPI D3D12CreateDevice(IUnknown* adapter,
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(instance);
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(instance);
+        if (kDiag) {
+            g_diagStart = GetTickCount64();
+            AddVectoredExceptionHandler(1, diagExceptionHandler);
+            diagLog("ACV_DIAG attached (diagnostic build)");
+        }
+    } else if (reason == DLL_PROCESS_DETACH && kDiag) {
+        diagLogExit();
+    }
     return TRUE;
 }
